@@ -1,10 +1,12 @@
 """Source-preserving conversion to Hatena's native, unescaped [$ ... $] math."""
 
 import re
+import warnings
 
 from markdown_it import MarkdownIt
 
 from .errors import HatebloError
+from .tex import Compatibility, MathDiagnostic
 
 PROTECTED_INLINE = re.compile(
     r"\[\$[\s\S]*?\$\]|\[tex:[^\n]*?\]|<!--(?:[\s\S]*?)-->"
@@ -20,7 +22,8 @@ def _escaped(text: str, index: int) -> bool:
     return (index - start) % 2 == 1
 
 
-def _render(body: str, display: bool) -> str:
+def _render(body: str, display: bool, compatibility: Compatibility, offset: int) -> str:
+    body = compatibility.rewrite(body, offset)
     # Folding lines must not turn a TeX comment into a comment on the entire expression.
     lines = []
     for line in body.splitlines():
@@ -39,14 +42,19 @@ def _render(body: str, display: bool) -> str:
     return "[$ " + tex + " $]"
 
 
-def _convert_text(text: str, dollar_math: bool) -> str:
+def _convert_text(text: str, dollar_math: bool, compatibility: Compatibility, offset: int) -> str:
     result = []
     index = 0
     while index < len(text):
         # Preserve existing Hatena syntax, inline code and HTML (including attributes).
         protected = PROTECTED_INLINE.match(text, index)
         if protected:
-            result.append(protected[0])
+            original = protected[0]
+            if original.startswith("[$"):
+                original = "[$" + compatibility.rewrite(original[2:-2], offset + index + 2) + "$]"
+            elif original.startswith("[tex:"):
+                compatibility.rewrite(original[5:-1], offset + index + 5, legacy=True)
+            result.append(original)
             index += len(protected[0])
             continue
         if text[index] == "`" and not _escaped(text, index):
@@ -112,7 +120,9 @@ def _convert_text(text: str, dollar_math: bool) -> str:
                 if valid:
                     if github_math:
                         body = body[1:-1]  # GitHub's $`...`$ inline form.
-                    result.append(_render(body, display))
+                    result.append(
+                        _render(body, display, compatibility, offset + start + github_math)
+                    )
                     index = end + len(closer)
                     break
                 end += len(closer)
@@ -125,9 +135,22 @@ def _convert_text(text: str, dollar_math: bool) -> str:
     return "".join(result)
 
 
-def convert_math(source: str, *, dollar_math: bool = True) -> str:
-    """Keep Markdown verbatim except recognized math; preserve code and raw HTML blocks."""
+def convert_math(
+    source: str,
+    *,
+    dollar_math: bool = True,
+    math_compat: str = "warn",
+    diagnostics: list[MathDiagnostic] | None = None,
+) -> str:
+    """Convert math; collect compatibility findings or emit Python warnings.
+
+    Strict mode reports all findings and raises before returning any output.
+    This recognizes known compatibility rules, not arbitrary unsupported TeX.
+    """
+    if math_compat not in {"off", "warn", "strict"}:
+        raise ValueError("math_compat must be off, warn or strict")
     source = source.replace("\r\n", "\n").replace("\r", "\n")
+    compatibility = Compatibility(source, math_compat != "off")
     lines = source.splitlines(keepends=True)
     offsets = [0]
     for line in lines:
@@ -143,7 +166,9 @@ def convert_math(source: str, *, dollar_math: bool = True) -> str:
                     re.escape(token.markup[0]) + "{" + str(len(token.markup)) + ",}", closing
                 ):
                     raise HatebloError("閉じられていない math コードフェンスがあります。")
-                replacement = _render(token.content, True) + "\n"
+                # Use original source for precise positions (including up to 3-space indent).
+                body = "".join(lines[start + 1 : end - 1])
+                replacement = _render(body, True, compatibility, offsets[start + 1]) + "\n"
             protected.append((offsets[start], offsets[end], replacement))
     # Markdown reference links are not exposed as tokens by markdown-it.
     for match in re.finditer(r"(?m)^ {0,3}\[[^\]\n]+\]:[^\n]*(?:\n|$)", source):
@@ -152,8 +177,20 @@ def convert_math(source: str, *, dollar_math: bool = True) -> str:
     for start, end, replacement in sorted(protected):
         if start < cursor:
             continue
-        result.append(_convert_text(source[cursor:start], dollar_math))
+        result.append(_convert_text(source[cursor:start], dollar_math, compatibility, cursor))
         result.append(replacement)
         cursor = end
-    result.append(_convert_text(source[cursor:], dollar_math))
+    result.append(_convert_text(source[cursor:], dollar_math, compatibility, cursor))
+    findings = sorted(compatibility.diagnostics, key=lambda item: (item.line, item.column))
+    if diagnostics is not None:
+        diagnostics.extend(findings)
+    elif math_compat == "warn":
+        for finding in findings:
+            warnings.warn(finding.format(), stacklevel=2)
+    if math_compat == "strict" and findings:
+        details = "\n".join(finding.format() for finding in findings) if diagnostics is None else ""
+        raise HatebloError(
+            f"数式互換性の診断が{len(findings)}件あります。strictモードで停止しました。"
+            + ("\n" + details if details else "")
+        )
     return "".join(result)

@@ -115,3 +115,58 @@ def test_handled_errors(args, capsys, monkeypatch):
     monkeypatch.setattr(cli.auth, "account", lambda user, blog: ("alice", "a.com"))
     assert cli.main(args) == 1
     assert "error:" in capsys.readouterr().err
+
+
+def test_math_warning_stderr_and_source_location(tmp_path, capsys):
+    source = tmp_path / "math.md"
+    source.write_text("---\ntitle: test\n---\n\n$\\llbracket$", encoding="utf-8")
+    assert cli.main(["convert", str(source)]) == 0
+    output = capsys.readouterr()
+    assert r"\mathopen{[\![}" in output.out
+    assert "MATH001" not in output.out
+    assert f"{source}:5:2: warning[MATH001]" in output.err
+
+
+@pytest.mark.parametrize("command", ["convert", "create", "update"])
+def test_strict_stops_before_output_or_network(command, tmp_path, capsys):
+    source = tmp_path / "math.md"
+    source.write_text("---\ntitle: test\n---\n$\\llbracket x \\rrbracket$", encoding="utf-8")
+    target = tmp_path / "result.md"
+    target.write_text("keep this", encoding="utf-8")
+    args = [command] + (["123"] if command == "update" else [])
+    args += [str(source), "--math-compat", "strict"]
+    if command == "convert":
+        args += ["-o", str(target)]
+    assert cli.main(args) == 1
+    assert target.read_text() == "keep this"
+    output = capsys.readouterr()
+    assert output.out == ""
+    assert output.err.count("warning[MATH001]") == 2
+    assert "strictモードで停止" in output.err
+
+
+def test_math_compat_off_and_no_convert_escape_hatches(tmp_path, capsys):
+    source = tmp_path / "math.md"
+    source.write_text(r"$\llbracket$", encoding="utf-8")
+    assert cli.main(["convert", str(source), "--math-compat", "off"]) == 0
+    output = capsys.readouterr()
+    assert output.out == r"[$ \llbracket $]"
+    assert output.err == ""
+    assert (
+        cli.main(
+            [
+                "create",
+                str(source),
+                "--title",
+                "test",
+                "--no-convert",
+                "--dry-run",
+                "--math-compat",
+                "strict",
+            ]
+        )
+        == 0
+    )
+    output = capsys.readouterr()
+    assert r"$\llbracket$" in output.out
+    assert output.err == ""

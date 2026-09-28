@@ -30,6 +30,12 @@ def parser() -> argparse.ArgumentParser:
     convert.add_argument("-o", "--output", help="出力先（省略時: 標準出力）")
     convert.add_argument("--strip-front-matter", action="store_true")
     convert.add_argument("--no-dollar-math", action="store_true", help="ドル区切りを変換しない")
+    convert.add_argument(
+        "--math-compat",
+        choices=("warn", "strict", "off"),
+        default="warn",
+        help="既知の数式互換変換: warn=変換と警告 / strict=診断時に停止 / off=無効",
+    )
     commands.add_parser("list", help="記事一覧をJSON出力").add_argument(
         "--all", action="store_true", help="全ページを取得する"
     )
@@ -57,6 +63,12 @@ def parser() -> argparse.ArgumentParser:
         command.add_argument("--no-convert", action="store_true", help="本文の数式を変換しない")
         command.add_argument("--no-dollar-math", action="store_true")
         command.add_argument(
+            "--math-compat",
+            choices=("warn", "strict", "off"),
+            default="warn",
+            help="既知の数式互換変換: warn=変換と警告 / strict=診断時に停止 / off=無効",
+        )
+        command.add_argument(
             "--dry-run", action="store_true", help="送信予定XMLを表示し、書き込まない"
         )
     delete = commands.add_parser("delete", help="記事を削除")
@@ -78,6 +90,20 @@ def make_client(args) -> Client:
     return Client(user, blog, auth.api_key(user, blog))
 
 
+def convert_document(document, args) -> str:
+    diagnostics = []
+    try:
+        return convert_math(
+            document.body,
+            dollar_math=not args.no_dollar_math,
+            math_compat=args.math_compat,
+            diagnostics=diagnostics,
+        )
+    finally:
+        for finding in diagnostics:
+            print(finding.format(args.file, document.front_matter.count("\n")), file=sys.stderr)
+
+
 def write_entry(args) -> None:
     document = parse_document(read_text(args.file)) if args.file else None
     meta = document.metadata if document else {}
@@ -96,7 +122,7 @@ def write_entry(args) -> None:
         raise HatebloError("カスタムURLは空にできません。")
     content = document.body if document else None
     if content is not None and not args.no_convert:
-        content = convert_math(content, dollar_math=not args.no_dollar_math)
+        content = convert_document(document, args)
     draft = False if args.publish else True if args.draft else None
     client, existing = None, None
     if args.command == "create":
@@ -126,8 +152,8 @@ def write_entry(args) -> None:
 def run(args) -> None:
     if args.command == "convert":
         document = parse_document(read_text(args.file))
-        result = ("" if args.strip_front_matter else document.front_matter) + convert_math(
-            document.body, dollar_math=not args.no_dollar_math
+        result = ("" if args.strip_front_matter else document.front_matter) + convert_document(
+            document, args
         )
         if args.output:
             Path(args.output).write_text(result, encoding="utf-8", newline="\n")
